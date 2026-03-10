@@ -1,0 +1,242 @@
+SAC Annotation Background
+=========================
+
+This document covers the prerequisite knowledge for understanding how
+SAC (Selective Activation Checkpointing) annotates FX graph nodes during
+torch.compile.
+
+
+1. What SAC does at a high level
+---------------------------------
+
+Activation checkpointing saves memory by not storing intermediate
+activations during forward, instead recomputing them during backward.
+SAC lets the user choose per-op: save this activation, or recompute it.
+
+The user provides a policy function:
+
+    def policy_fn(ctx, func, *args, **kwargs):
+        if func == aten.mm.default:
+            return CheckpointPolicy.MUST_SAVE
+        return CheckpointPolicy.PREFER_RECOMPUTE
+
+During torch.compile, SAC must annotate each FX node in the joint
+(forward+backward) graph with the policy's decision. The min-cut
+partitioner then uses these annotations to decide the forward/backward
+boundary.
+
+
+2. The mode stack during AOTAutograd tracing
+---------------------------------------------
+
+When torch.compile traces through a checkpointed region, the dispatch
+mode stack looks like this (top = dispatched first):
+
+    _CachingTorchDispatchMode     [user mode, checkpoint.py]
+         |
+         v
+    ProxyTorchDispatchMode        [infra mode, proxy_tensor.py:1756]
+         |
+         v
+    FunctionalTensorMode          [infra mode]
+         |
+         v
+    FakeTensorMode                [infra mode]
+
+When _CachingTorchDispatchMode calls func(*args, **kwargs), the op
+dispatches to ProxyTorchDispatchMode, which creates FX nodes and
+computes fake tensor metadata.
+
+
+3. How FX nodes are created
+----------------------------
+
+When an op reaches ProxyTorchDispatchMode, it calls proxy_call()
+(proxy_tensor.py:1108). proxy_call does:
+
+    1. Check maybe_handle_decomp() for decomposition table entries
+    2. Check autograd_would_have_decomposed() for CompositeImplicit ops
+    3. If no decomposition: create FX node via tracer.create_proxy()
+
+The FX node is created at proxy_tensor.py:1205-1211:
+
+    proxy_out = proxy_mode.tracer.create_proxy(
+        "call_function", func, proxy_args, proxy_kwargs, ...)
+
+This calls TracerBase.create_node (proxy.py:202), which appends a
+node to the graph.
+
+For multi-output ops (e.g. topk returns (values, indices)), the
+call_function node is created first, then getitem nodes are created
+when track_tensor_tree (proxy_tensor.py:1278) indexes into the proxy:
+
+    proxy[0]  ->  creates call_function node for operator.getitem
+    proxy[1]  ->  creates call_function node for operator.getitem
+
+Key fact: getitem nodes are created INSIDE func(*args, **kwargs) from
+the SAC mode's perspective (they're created within proxy_call, which
+is called during the dispatch).
+
+
+4. How current_meta populates node.meta
+----------------------------------------
+
+fx_traceback.current_meta is a module-level dict (traceback.py:38).
+
+When TracerBase.create_node creates a new FX node (proxy.py:202), it
+checks if preserved_node_meta is active (proxy.py:231). If so, it
+copies whitelisted fields from current_meta into node.meta:
+
+    for field in _COPY_META_FIELDS:          # proxy.py:243
+        if field in current_meta:
+            node.meta[field] = copy.copy(current_meta[field])
+
+_COPY_META_FIELDS includes "recompute" (proxy.py:161).
+
+This means: whatever value is in current_meta["recompute"] at the
+moment a node is created gets stamped onto that node.
+
+
+5. How decomposition works
+---------------------------
+
+There are two decomposition paths:
+
+Path A: Decomposition table (post-mode decomp)
+    maybe_handle_decomp (proxy_tensor.py:2882) checks if the op is in
+    CURRENT_DECOMPOSITION_TABLE. If so, it calls the decomposition
+    function with proxy_mode as context:
+
+        with proxy_mode:
+            proxy_mode.decomp_layers += 1
+            out = CURRENT_DECOMPOSITION_TABLE[op](*args, **kwargs)
+            proxy_mode.decomp_layers -= 1
+
+    The decomposed sub-ops dispatch from the top of the mode stack,
+    so they re-enter _CachingTorchDispatchMode.
+
+Path B: CompositeImplicitAutograd (pre-mode decomp)
+    If autograd_would_have_decomposed() is true (proxy_tensor.py:1122),
+    proxy_call calls func.decompose(*args, **kwargs) with proxy_mode
+    as context. Sub-ops also re-enter the full mode stack.
+
+In both cases, each decomposed sub-op gets its own SAC dispatch:
+its own policy call and its own node tagging.
+
+
+6. SAC_IGNORED_OPS
+-------------------
+
+Some ops are skipped by the SAC policy (checkpoint.py:1321-1328):
+
+    SAC_IGNORED_OPS = {
+        torch.ops.aten.detach.default,
+        torch.ops.prim.device.default,
+    } | set(FunctionalTensor.metadata_fns)
+
+These are ops like detach and metadata queries (is_contiguous, dim,
+stride, etc.) that are trivially cheap. The policy function is never
+called for these ops.
+
+
+7. The annotation mechanism (old vs new)
+-----------------------------------------
+
+OLD (before this PR):
+
+    def __torch_dispatch__(self, func, ...):
+        if func in SAC_IGNORED_OPS:
+            return func(*args, **kwargs)          # no annotation set
+
+        policy = self.policy_fn(ctx, func, ...)   # policy BEFORE op
+        fx_traceback.current_meta["recompute"] = policy
+        out = func(*args, **kwargs)               # nodes inherit current_meta
+        ...
+
+    Problem: ignored ops don't clear current_meta, so they inherit
+    the previous op's annotation (leak).
+
+NEW (this PR):
+
+    def __torch_dispatch__(self, func, ...):
+        if func in SAC_IGNORED_OPS:
+            fx_traceback.current_meta["recompute"] = PREFER_RECOMPUTE
+            return func(*args, **kwargs)
+
+        graph_len_before = len(list(graph.nodes))
+        out = func(*args, **kwargs)               # nodes created here
+        policy = self.policy_fn(ctx, func, ...)   # policy AFTER op
+        for node in graph.nodes[graph_len_before:]:
+            node.meta["recompute"] = policy       # direct tagging
+
+    The policy is called after the op so it can inspect the output.
+    Nodes are tagged directly rather than via current_meta.
+
+
+8. Dispatch flow diagram for a single op
+------------------------------------------
+
+    _CachingTorchDispatchMode.__torch_dispatch__(func, args)
+        |
+        |  [snapshot graph_len_before]
+        |
+        |  func(*args, **kwargs)
+        |      |
+        |      v
+        |  ProxyTorchDispatchMode.__torch_dispatch__
+        |      |
+        |      v
+        |  proxy_call()
+        |      |
+        |      +-- maybe_handle_decomp?
+        |      |     YES: decomp sub-ops re-enter from top of stack
+        |      |     NO:  continue
+        |      |
+        |      +-- tracer.create_proxy("call_function", func, ...)
+        |      |     -> creates FX node, current_meta copied to node.meta
+        |      |
+        |      +-- out = func(*args, **kwargs)  [FakeTensorMode]
+        |      |
+        |      +-- track_tensor_tree(out, proxy_out)
+        |      |     -> for multi-output: creates getitem nodes
+        |      |
+        |      +-- return out
+        |
+        |  [policy = policy_fn(ctx, func, ...)]
+        |  [tag all nodes since graph_len_before with policy]
+        |
+        v  return out
+
+
+9. Dispatch flow for decomposed op
+------------------------------------
+
+    _CachingTorchDispatchMode.__torch_dispatch__(silu, args)
+        |
+        |  [snapshot graph_len_before = N]
+        |
+        |  func(*args, **kwargs)  -->  ProxyTorchDispatchMode
+        |      |
+        |      +-- maybe_handle_decomp(silu)  [in decomp table]
+        |            |
+        |            +-- decomp calls neg(x)
+        |            |     |
+        |            |     v  _CachingTorchDispatchMode  [re-entrant]
+        |            |        [snapshot, run, policy, tag neg node]
+        |            |
+        |            +-- decomp calls exp(...)
+        |            |     |
+        |            |     v  _CachingTorchDispatchMode  [re-entrant]
+        |            |        [snapshot, run, policy, tag exp node]
+        |            |
+        |            +-- ... (add, div)
+        |            |
+        |            +-- return out
+        |
+        |  [policy = policy_fn(ctx, silu, ...)]
+        |  [tag ALL nodes since N with silu's policy]     <-- OVERWRITES
+        |
+        v  return out
+
+    The outer silu dispatch's tagging at the end overwrites whatever
+    the re-entrant sub-op dispatches tagged on the inner nodes.

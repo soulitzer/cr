@@ -1,0 +1,278 @@
+SAC Annotation Risks: Line-by-Line Analysis
+=============================================
+
+This document examines each line of the new annotation mechanism in
+_CachingTorchDispatchMode.__torch_dispatch__ (checkpoint.py:1400-1453)
+and identifies risks, invariants, and failure modes.
+
+
+Line 1401: kwargs = {} if kwargs is None else kwargs
+-------------------------------------------------
+Risk: None. Defensive normalization.
+
+
+Line 1402: is_compiling = _is_compiling(func, args, kwargs)
+---------------------------------------------------------
+Risk: _is_compiling checks if PROXY dispatch mode is active. If this
+      check were wrong (false negative), nodes would be created but
+      never tagged. If wrong (false positive), we'd try to tag nodes
+      when there's no graph.
+
+Mitigation: The proxy_mode None check at line 1447 guards against the
+            false positive case. False negatives would silently skip
+            annotation — but this function has been stable.
+
+
+Lines 1407-1410: SAC_IGNORED_OPS handling
+-----------------------------------------
+
+  1407: if func in SAC_IGNORED_OPS:
+  1408:     if is_compiling:
+  1409:         fx_traceback.current_meta["recompute"] = PREFER_RECOMPUTE
+  1410:     return func(*args, **kwargs)
+
+Risk 1: current_meta is set BEFORE the op runs. This is the old
+        mechanism. It works because the value is set immediately
+        before func() creates nodes, so there's no window for
+        interference.
+
+Risk 2: current_meta is NOT cleared after the ignored op returns.
+        The stale PREFER_RECOMPUTE remains in current_meta. This is
+        harmless because the next non-ignored op uses the new direct
+        tagging mechanism (lines 1447-1449) which overwrites
+        node.meta["recompute"] regardless of what current_meta says.
+
+Risk 3: If an ignored op decomposes into sub-ops (via
+        maybe_handle_decomp or func.decompose), each sub-op
+        re-enters this dispatch. The sub-ops would be non-ignored
+        and would go through the full snapshot-tag path. But the
+        outer ignored op dispatch has no snapshot, so it can't do
+        post-tagging. The sub-ops would get whatever their own
+        policy calls return, not PREFER_RECOMPUTE.
+
+        Current status: Safe. SAC_IGNORED_OPS are detach and metadata
+        ops (is_contiguous, dim, stride, etc.) — none of these
+        decompose. But if a future ignored op decomposed, this path
+        would produce incorrect annotations.
+
+Risk 4: If an ignored op creates multiple FX nodes (e.g. due to some
+        internal decomposition not going through the mode stack),
+        all nodes inherit PREFER_RECOMPUTE via current_meta. This is
+        correct behavior.
+
+Risk 5: If func() at line 1410 raises an exception, current_meta
+        retains the stale PREFER_RECOMPUTE. Not a correctness issue
+        since an exception aborts compilation.
+
+
+Line 1414: proxy_mode = get_proxy_mode()
+-----------------------------------------
+Risk: proxy_mode could be None if we're not compiling. The None check
+      at line 1415 and 1447 handles this.
+
+Risk: proxy_mode could change between line 1414 and line 1448 (e.g.
+      if func() pops/pushes proxy modes). The snapshot would be from
+      one graph and the tagging from another.
+
+      Current status: Proxy mode is stable during AOTAutograd tracing.
+      No known path where it changes mid-dispatch.
+
+
+Line 1415: graph_len_before = len(list(proxy_mode.tracer.graph.nodes))
+----------------------------------------------------------------------
+Risk 1: Performance. This materializes the full linked list into a
+        Python list to get its length. For a graph with N nodes, this
+        is O(N) per dispatch. Over M dispatches, total cost is O(N*M).
+        Since N grows with M, worst case is O(M^2). For large models
+        (thousands of ops), this could be noticeable.
+
+        Mitigation: Could be replaced with a counter that tracks
+        insertions, but this is a performance concern, not correctness.
+
+Risk 2: The snapshot assumes nodes are only appended, never removed
+        or reordered, between the snapshot and tagging. If a node
+        were removed during func(), graph_len_before would be too
+        large and some new nodes would be missed.
+
+        Current status: Safe. FX graph nodes are append-only during
+        tracing. No deletion or reordering occurs.
+
+Risk 3: If proxy_mode is not None but proxy_mode.tracer or
+        proxy_mode.tracer.graph is in a bad state, this could crash.
+        Defensive: guarded by the is_compiling check which implies
+        proxy mode is active and functional.
+
+
+Line 1417: out = func(*args, **kwargs)
+--------------------------------------
+This is where all node creation happens. Risks relate to what happens
+INSIDE this call.
+
+Risk 1: Re-entrant dispatch. If func decomposes (via decomp table or
+        CompositeImplicit), sub-ops re-enter __torch_dispatch__. Each
+        sub-op does its own snapshot-tag cycle. The inner tags are
+        correct momentarily but get overwritten by the outer tag at
+        line 1449. This is intentional.
+
+Risk 2: If a sub-op is an SAC_IGNORED_OP, it sets current_meta to
+        PREFER_RECOMPUTE (line 1409) and returns. The next sub-op
+        that creates nodes via proxy_call will have
+        current_meta["recompute"] = PREFER_RECOMPUTE from the
+        ignored op. But this doesn't matter because the sub-op's
+        own dispatch will overwrite node.meta directly at line 1449
+        (if non-ignored) or the outer dispatch will overwrite
+        everything at line 1449.
+
+        Wait — there's a subtlety. When the sub-op creates a node via
+        create_proxy (proxy_tensor.py:1205), TracerBase.create_node
+        copies current_meta["recompute"] into node.meta["recompute"]
+        (proxy.py:243-245). So the node is initially stamped with
+        whatever is in current_meta at creation time. Then the sub-op's
+        post-tagging (line 1449) overwrites it. Then the outer op's
+        post-tagging (line 1449) overwrites it again.
+
+        So current_meta stale state only persists on a node if nothing
+        overwrites it. The only case where nothing overwrites is if
+        the node's dispatch is an ignored op (which does NOT do
+        post-tagging). And for ignored ops, current_meta is explicitly
+        set to PREFER_RECOMPUTE before the op runs. So ignored ops'
+        nodes get PREFER_RECOMPUTE from current_meta, and that value
+        is never overwritten. Correct.
+
+Risk 3: If func() creates nodes that are NOT from dispatched sub-ops
+        (e.g. proxy_tensor internals that insert bookkeeping nodes),
+        those nodes would be captured in the snapshot window and
+        tagged with the outer policy. This would be incorrect if
+        those nodes shouldn't carry a recompute annotation.
+
+        Current status: No known case of this happening. proxy_call
+        creates exactly the nodes for the op and its getitems.
+
+Risk 4: If func() raises, we never reach the tagging step. Nodes
+        created before the exception have whatever current_meta was
+        set. Not a correctness issue since exceptions abort tracing.
+
+
+Lines 1422-1425: Schema inspection
+-----------------------------------
+Risk: func._schema.returns could be expensive for some ops, but this
+      is metadata access, not dispatch. No node creation here.
+
+      The isinstance check for HigherOrderOperator (line 1422) is
+      safe — it's a type check, no dispatch.
+
+
+Lines 1427-1428: func_counter
+------------------------------
+Risk: If decomposed sub-ops re-enter this dispatch, they increment
+      their own func_counter entries (e.g. neg, exp each get counter
+      0). The outer op (silu) also gets its counter incremented. During
+      recompute (_CachedTorchDispatchMode), the same sequence must
+      occur in the same order. If the decomposition is deterministic
+      (same sub-ops in same order), this is correct.
+
+      Risk: Non-deterministic decomposition would cause counter
+      mismatch between forward and recompute. No known case of this.
+
+
+Lines 1431-1436: tensor_tracker
+--------------------------------
+Risk: WeakTensorKeyDictionary entries could be garbage collected if
+      tensors go out of scope. This affects checkpoint_name()
+      functionality, not annotation correctness.
+
+
+Lines 1440-1443: Policy call (post-op)
+---------------------------------------
+Risk 1: The policy function could have side effects (dispatch ops,
+        modify state). If it dispatches an op through proxy mode,
+        that op would create a node between the func() nodes and the
+        tagging step. The tagging at line 1449 would then tag this
+        spurious node with the current policy.
+
+        Current status: Policy functions are expected to be pure
+        (inspect func/args/output, return a policy). No enforcement.
+
+Risk 2: The policy function receives op_output=out. If the policy
+        modifies out (e.g. in-place mutation), this could affect
+        the op's actual output. Not specific to the annotation
+        mechanism.
+
+Risk 3: _policy_from_bool at line 1443 converts True/False to
+        CheckpointPolicy. This is backwards-compatible behavior.
+        No annotation risk.
+
+
+Lines 1445-1449: Direct node tagging
+--------------------------------------
+
+  1447: if proxy_mode is not None and graph_len_before is not None:
+  1448:     for node in list(proxy_mode.tracer.graph.nodes)[graph_len_before:]:
+  1449:         node.meta["recompute"] = policy
+
+Risk 1: list(graph.nodes)[graph_len_before:] materializes the full
+        node list AGAIN (already done at line 1415). Two O(N)
+        operations per dispatch.
+
+Risk 2: The slice [graph_len_before:] captures ALL nodes appended
+        since the snapshot, including:
+        - The op's own call_function node
+        - getitem nodes for multi-output ops
+        - Nodes from decomposed sub-ops
+        - Nodes from any re-entrant non-ignored dispatch
+
+        All of these get tagged with the SAME policy. For decomposed
+        ops, this means the outer policy overwrites the sub-ops'
+        individual policies. This is intentional — the user targets
+        the op they called, not implementation details.
+
+        But: if the user's policy ALSO returns specific values for
+        sub-ops (e.g. policy returns MUST_SAVE for both silu AND neg),
+        the sub-op's policy is called (wasted work) and then
+        overwritten. No correctness issue, but potentially confusing
+        if the user expects fine-grained control of decomposed ops.
+
+Risk 3: If no nodes were created (graph_len_before == current length),
+        the slice is empty and the loop is a no-op. Safe.
+
+Risk 4: If graph_len_before is stale (e.g. proxy_mode changed), the
+        slice could be too wide (tagging nodes from before this op)
+        or too narrow (missing nodes). See proxy_mode stability risk
+        at line 1414.
+
+Risk 5: This sets node.meta["recompute"] unconditionally, overwriting
+        any value that was already there (e.g. from current_meta at
+        node creation time, or from a re-entrant sub-op dispatch).
+        This is intentional — the outermost dispatch's policy wins.
+
+
+Line 1451-1452: Storage
+-------------------------
+Risk: Storage is populated for all ops during compile
+      (is_compiling = True), regardless of policy. This is needed for
+      recompute matching. The annotation itself (node.meta) is what
+      the partitioner uses, not the storage. Storage correctness is
+      orthogonal to annotation correctness.
+
+
+Summary of highest-risk items
+------------------------------
+
+1. PERFORMANCE: O(N) per dispatch for graph length snapshot and node
+   list materialization. Quadratic overall. Could be fixed with an
+   insertion counter.
+
+2. IMPLICIT INVARIANT: No node creation between func() return and
+   post-tagging (lines 1417-1449). Currently true but not enforced.
+   A future change that adds an op dispatch in the policy function
+   or in the schema inspection code could break this silently.
+
+3. IGNORED OP DECOMPOSITION: If a future SAC_IGNORED_OP decomposes,
+   the current_meta approach at line 1409 would not correctly tag
+   the decomposed sub-ops' nodes. Currently safe because all ignored
+   ops are simple (detach, metadata).
+
+4. NON-DETERMINISTIC DECOMPOSITION: If an op's decomposition is
+   non-deterministic (different sub-ops across forward/recompute),
+   func_counter entries would mismatch. Currently safe because all
+   decompositions are deterministic.
