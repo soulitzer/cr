@@ -1,18 +1,28 @@
-SAC Annotation Risks: Line-by-Line Analysis
-=============================================
+SAC Annotation Risks
+=====================
 
-This document examines each line of the new annotation mechanism in
-_CachingTorchDispatchMode.__torch_dispatch__ (checkpoint.py:1400-1453)
-and identifies risks, invariants, and failure modes.
+This document examines the annotation mechanism refactor in
+_CachingTorchDispatchMode.__torch_dispatch__ (checkpoint.py:1400-1453),
+covering correctness risks, performance, API footguns, and backward
+compatibility.
+
+Scope: only covers the commit that moves policy evaluation to post-op
+("Add post-op policy and AutoNamingMode for selective activation
+checkpointing") and its companion test commit.
+
+
+=============================================================
+PART 1: LINE-BY-LINE ANALYSIS OF _CachingTorchDispatchMode
+=============================================================
 
 
 Line 1401: kwargs = {} if kwargs is None else kwargs
--------------------------------------------------
+-----------------------------------------------------
 Risk: None. Defensive normalization.
 
 
 Line 1402: is_compiling = _is_compiling(func, args, kwargs)
----------------------------------------------------------
+------------------------------------------------------------
 Risk: _is_compiling checks if PROXY dispatch mode is active. If this
       check were wrong (false negative), nodes would be created but
       never tagged. If wrong (false positive), we'd try to tag nodes
@@ -24,7 +34,7 @@ Mitigation: The proxy_mode None check at line 1447 guards against the
 
 
 Lines 1407-1410: SAC_IGNORED_OPS handling
------------------------------------------
+------------------------------------------
 
   1407: if func in SAC_IGNORED_OPS:
   1408:     if is_compiling:
@@ -79,15 +89,19 @@ Risk: proxy_mode could change between line 1414 and line 1448 (e.g.
 
 
 Line 1415: graph_len_before = len(list(proxy_mode.tracer.graph.nodes))
-----------------------------------------------------------------------
+-----------------------------------------------------------------------
 Risk 1: Performance. This materializes the full linked list into a
         Python list to get its length. For a graph with N nodes, this
         is O(N) per dispatch. Over M dispatches, total cost is O(N*M).
         Since N grows with M, worst case is O(M^2). For large models
         (thousands of ops), this could be noticeable.
 
-        Mitigation: Could be replaced with a counter that tracks
-        insertions, but this is a performance concern, not correctness.
+        Fix: len(proxy_mode.tracer.graph.nodes) is already O(1) —
+        _node_list.__len__ returns graph._len, which is maintained
+        incrementally. The list() wrapping is unnecessary. Same issue
+        at line 1448 where the list is materialized again for slicing.
+        A reversed() iteration stopping after n_new nodes would make
+        the tagging O(new nodes) using only public API.
 
 Risk 2: The snapshot assumes nodes are only appended, never removed
         or reordered, between the snapshot and tagging. If a node
@@ -104,7 +118,7 @@ Risk 3: If proxy_mode is not None but proxy_mode.tracer or
 
 
 Line 1417: out = func(*args, **kwargs)
---------------------------------------
+---------------------------------------
 This is where all node creation happens. Risks relate to what happens
 INSIDE this call.
 
@@ -123,21 +137,20 @@ Risk 2: If a sub-op is an SAC_IGNORED_OP, it sets current_meta to
         (if non-ignored) or the outer dispatch will overwrite
         everything at line 1449.
 
-        Wait — there's a subtlety. When the sub-op creates a node via
-        create_proxy (proxy_tensor.py:1205), TracerBase.create_node
-        copies current_meta["recompute"] into node.meta["recompute"]
+        Details: When the sub-op creates a node via create_proxy
+        (proxy_tensor.py:1205), TracerBase.create_node copies
+        current_meta["recompute"] into node.meta["recompute"]
         (proxy.py:243-245). So the node is initially stamped with
-        whatever is in current_meta at creation time. Then the sub-op's
-        post-tagging (line 1449) overwrites it. Then the outer op's
-        post-tagging (line 1449) overwrites it again.
+        whatever is in current_meta at creation time. Then the
+        sub-op's post-tagging (line 1449) overwrites it. Then the
+        outer op's post-tagging (line 1449) overwrites it again.
 
-        So current_meta stale state only persists on a node if nothing
-        overwrites it. The only case where nothing overwrites is if
-        the node's dispatch is an ignored op (which does NOT do
-        post-tagging). And for ignored ops, current_meta is explicitly
-        set to PREFER_RECOMPUTE before the op runs. So ignored ops'
-        nodes get PREFER_RECOMPUTE from current_meta, and that value
-        is never overwritten. Correct.
+        So current_meta stale state only persists on a node if
+        nothing overwrites it. The only case where nothing overwrites
+        is if the node's dispatch is an ignored op (which does NOT
+        do post-tagging). And for ignored ops, current_meta is
+        explicitly set to PREFER_RECOMPUTE before the op runs.
+        Correct.
 
 Risk 3: If func() creates nodes that are NOT from dispatched sub-ops
         (e.g. proxy_tensor internals that insert bookkeeping nodes),
@@ -147,6 +160,11 @@ Risk 3: If func() creates nodes that are NOT from dispatched sub-ops
 
         Current status: No known case of this happening. proxy_call
         creates exactly the nodes for the op and its getitems.
+
+        Note: the OLD mechanism (pre-op current_meta) has the same
+        over-tagging behavior — any node created during func()
+        inherits current_meta["recompute"]. So this is not a new
+        risk introduced by the refactor.
 
 Risk 4: If func() raises, we never reach the tagging step. Nodes
         created before the exception have whatever current_meta was
@@ -255,24 +273,162 @@ Risk: Storage is populated for all ops during compile
       orthogonal to annotation correctness.
 
 
-Summary of highest-risk items
-------------------------------
+==========================================================
+PART 2: CROSS-CUTTING RISKS (BEYOND LINE-BY-LINE)
+==========================================================
+
+
+Backward compatibility: policy called post-op instead of pre-op
+-----------------------------------------------------------------
+The policy function is now invoked AFTER func() instead of before it.
+This is the core semantic change and affects all existing users.
+
+Risk 1: Side-effect ordering. Any user policy that has side effects
+        (e.g. incrementing a counter, logging) will now see those
+        side effects at a different point relative to the op's
+        execution. A policy that inspects mutable state modified by
+        the op itself could see different values than before.
+
+Risk 2: Policies that inspect *args. If the op mutates its inputs
+        in-place, the policy now sees post-mutation arg state. The
+        old code called policy before the op, so it saw pre-mutation
+        state. This is unlikely in practice (SAC ops that mutate
+        inputs are rare), but it's a semantic difference.
+
+Risk 3: This is a behavior change for every user, not just those
+        using the new op_output feature. Even policies that ignore
+        op_output are now called at a different time.
+
+Mitigation: The change is backwards compatible in the common case
+        (stateless policies that branch on func identity). Document
+        the change prominently in the PR.
+
+
+op_output footgun: None during recompute
+------------------------------------------
+During forward, policy receives op_output=out on the context. During
+recompute (_CachedTorchDispatchMode), the policy is called with
+SelectiveCheckpointContext(is_recompute=True) — op_output defaults to
+None. This asymmetry creates a footgun:
+
+    def policy_fn(ctx, func, *args, **kwargs):
+        if ctx.op_output.shape[0] > 1024:  # CRASH during recompute
+            return CheckpointPolicy.MUST_SAVE
+        ...
+
+Any policy that unconditionally accesses ctx.op_output attributes will
+crash during backward.
+
+Mitigation options:
+  (a) Document that op_output is forward-only and must be guarded with
+      ctx.is_recompute or a None check.
+  (b) With indexed storage (commit 651fb5b), the backward policy call
+      is vestigial — the cached mode looks up by index, not by policy
+      return value. Could skip calling policy entirely during recompute,
+      eliminating the footgun. This is a larger change.
+
+
+op_output: tensor identity and type
+--------------------------------------
+Since _CachingTorchDispatchMode is a TorchDispatchMode, out is the
+result of dispatching through inner modes (ProxyTorchDispatchMode,
+FunctionalTensorMode, FakeTensorMode). During compilation, the tensor
+the policy sees may be a FakeTensor or a proxy wrapper, not the plain
+user tensor.
+
+Risk: Policy functions that check values (e.g. out.item() > threshold)
+      will fail during compile because FakeTensors don't carry real
+      data. Policies that check shape/dtype/device are fine.
+
+In eager mode, out is the real tensor. This means the same policy
+function may behave differently under compile vs eager, which could be
+confusing.
+
+Mitigation: Document that op_output is a FakeTensor during compile and
+      only metadata inspection is reliable.
+
+
+op_output: reference retention defeats checkpointing
+------------------------------------------------------
+The policy function receives a reference to the op's output tensor. If
+a user policy stores this reference (e.g. in a list for debugging), it
+prevents the tensor from being garbage collected, potentially
+increasing peak memory and defeating the purpose of activation
+checkpointing.
+
+Mitigation: Document that op_output should be inspected transiently
+      within the policy call and not retained.
+
+
+Backward mode asymmetry with op_output
+----------------------------------------
+The forward mode (_CachingTorchDispatchMode) calls policy with
+op_output=out. The backward mode (_CachedTorchDispatchMode) calls
+policy with only is_recompute=True (no op_output, no tensor_name).
+
+This means policies written for the new API need two code paths:
+
+    def policy_fn(ctx, func, *args, **kwargs):
+        if ctx.is_recompute:
+            # op_output is None here, can't inspect it
+            return CheckpointPolicy.PREFER_RECOMPUTE
+        # forward path: can use ctx.op_output
+        ...
+
+The backward mode's policy call result still matters: it determines
+whether to look up from cache or recompute. If the backward policy
+returns a DIFFERENT value than forward (because it can't inspect
+op_output), the behavior changes. With indexed storage this is less
+of an issue since cache lookup is by index, but without it, a
+mismatch causes incorrect save/recompute decisions.
+
+
+Commit ordering / bisectability
+---------------------------------
+Commit 5cf1f50 adds test_pre_mode_decomp_has_sac_ignored_ops which
+asserts detach_1 -> MUST_SAVE. Commit 2893e33 changes the expected
+output to PREFER_RECOMPUTE (because the code fix now explicitly tags
+ignored ops). Between these two commits, the test documents a
+known-buggy state. Not a correctness risk, but means the commits are
+not independently correct for bisection.
+
+
+==========================================================
+PART 3: SUMMARY
+==========================================================
+
+
+Highest-risk items (ranked)
+-----------------------------
 
 1. PERFORMANCE: O(N) per dispatch for graph length snapshot and node
-   list materialization. Quadratic overall. Could be fixed with an
-   insertion counter.
+   list materialization. Quadratic overall.
+
+   Fix: len(graph.nodes) is O(1) — just drop the list() wrapping.
+   For the tagging loop, iterate reversed(graph.nodes) and stop
+   after n_new nodes. All public API, O(new nodes).
 
 2. IMPLICIT INVARIANT: No node creation between func() return and
    post-tagging (lines 1417-1449). Currently true but not enforced.
    A future change that adds an op dispatch in the policy function
    or in the schema inspection code could break this silently.
 
-3. IGNORED OP DECOMPOSITION: If a future SAC_IGNORED_OP decomposes,
+3. op_output FOOTGUN: None during recompute. Policy authors who
+   access ctx.op_output without guarding on ctx.is_recompute will
+   get AttributeError during backward. Needs documentation or,
+   better, skip the policy call during recompute with indexed storage.
+
+4. BACKWARD COMPATIBILITY: Policy is called post-op. Existing
+   policies with side effects or mutable-state inspection see
+   different behavior. Low probability of real-world impact but
+   affects every SAC user.
+
+5. IGNORED OP DECOMPOSITION: If a future SAC_IGNORED_OP decomposes,
    the current_meta approach at line 1409 would not correctly tag
    the decomposed sub-ops' nodes. Currently safe because all ignored
    ops are simple (detach, metadata).
 
-4. NON-DETERMINISTIC DECOMPOSITION: If an op's decomposition is
+6. NON-DETERMINISTIC DECOMPOSITION: If an op's decomposition is
    non-deterministic (different sub-ops across forward/recompute),
    func_counter entries would mismatch. Currently safe because all
    decompositions are deterministic.
