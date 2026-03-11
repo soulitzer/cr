@@ -17,20 +17,50 @@ else to the inner ctx.
 
 Implementation
 --------------
+The wrapper reuses functorch's WrappedCtx pattern (torch/_functorch/autograd_function.py),
+redefined in torch/_library/autograd.py to avoid a circular import. It uses
+_pt_reserved_attrs to distinguish wrapper-internal fields from user-set fields
+on ctx, forwarding everything else to the inner ctx.
+
     class _WrappedCtx:
-        def __init__(self, inner_ctx, needs_input_grad):
-            self.__dict__["_inner_ctx"] = inner_ctx
-            self.__dict__["_needs_input_grad"] = needs_input_grad
+        _pt_reserved_attrs: tuple[str, ...] = ("_pt_reserved_attrs", "_pt_inner_ctx")
+
+        def __init__(self, ctx):
+            if not isinstance(ctx, _WrappedCtx):
+                reserved_attrs = type(self)._pt_reserved_attrs
+                for name in reserved_attrs:
+                    if not hasattr(ctx, name):
+                        continue
+                    raise RuntimeError(
+                        f"PyTorch reserves the {reserved_attrs} field on ctx. "
+                        "Please name your fields on ctx something else to avoid "
+                        "name collision."
+                    )
+            self._pt_inner_ctx = ctx
+
+        def __getattr__(self, name):
+            return getattr(self._pt_inner_ctx, name)
+
+        def __setattr__(self, name, value):
+            if name in type(self)._pt_reserved_attrs:
+                self.__dict__[name] = value
+                return
+            return setattr(self._pt_inner_ctx, name, value)
+
+    class _CtxWithNeedsInputGrad(_WrappedCtx):
+        _pt_reserved_attrs = ("_pt_needs_input_grad", *_WrappedCtx._pt_reserved_attrs)
+
+        def __init__(self, ctx, needs_input_grad):
+            super().__init__(ctx)
+            self._pt_needs_input_grad = needs_input_grad
 
         @property
         def needs_input_grad(self):
-            return self._needs_input_grad
+            return self._pt_needs_input_grad
 
-        def __getattr__(self, name):
-            return getattr(self._inner_ctx, name)
-
-        def __setattr__(self, name, value):
-            setattr(self._inner_ctx, name, value)
+The base _WrappedCtx is identical to functorch's WrappedCtx (which is also used
+by CtxWithSavedTensors and CtxCustomSave for vmap/grad transforms).
+_CtxWithNeedsInputGrad extends it to intercept needs_input_grad specifically.
 
 Scope
 -----
@@ -142,9 +172,9 @@ User-set attributes:
 Object Protocol
 ---------------
   isinstance(ctx, FunctionCtx)    WRONG  returns False          risk: MEDIUM
-  type(ctx)                       WRONG  returns _WrappedCtx    risk: LOW
-  vars(ctx) / ctx.__dict__        OK     works (no __slots__)
-  dir(ctx)                        WARN   shows _WrappedCtx attrs  risk: VERY LOW
+  type(ctx)                       WRONG  returns _CtxWithNeedsInputGrad  risk: LOW
+  vars(ctx) / ctx.__dict__        OK     works (shows _pt_* reserved attrs)
+  dir(ctx)                        WARN   shows _CtxWithNeedsInputGrad attrs  risk: VERY LOW
   repr(ctx) / str(ctx)            WARN   default object.__repr__  risk: VERY LOW
   id(ctx) / is                    WARN   different identity       risk: VERY LOW
   weakref.ref(ctx)                OK     works (has __weakref__)
@@ -158,12 +188,12 @@ Object Protocol
 Top Risks
 ---------
 1. isinstance checks (Medium): isinstance(ctx, FunctionCtx) returns False.
-   Mitigable by adding a __class__ property that returns type(self._inner_ctx).
+   Mitigable by adding a __class__ property that returns type(self._pt_inner_ctx).
    This is the only realistic risk.
 
-2. type() checks (Low): type(ctx) is BackwardCFunction returns False. Not
-   fixable without a C extension type. However, type() exact checks are
-   uncommon -- isinstance is the standard idiom.
+2. type() checks (Low): type(ctx) is BackwardCFunction returns False (returns
+   _CtxWithNeedsInputGrad). Not fixable without a C extension type. However,
+   type() exact checks are uncommon -- isinstance is the standard idiom.
 
 3. Wrapper is only used for torch.library ops (context): The wrapper only
    applies to ops registered via torch.library.register_autograd. User-written
@@ -176,8 +206,8 @@ Should we add __class__ property forwarding?
 
     @property
     def __class__(self):
-        return type(self._inner_ctx)
+        return type(self._pt_inner_ctx)
 
 This makes isinstance transparent. The tradeoff is that it makes the wrapper
 subtler to debug -- isinstance says it's a BackwardCFunction but type() says
-it's _WrappedCtx.
+it's _CtxWithNeedsInputGrad.
