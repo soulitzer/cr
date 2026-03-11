@@ -1,0 +1,213 @@
+_WrappedCtx Wrapper Analysis
+=============================
+
+Background
+----------
+PR https://github.com/pytorch/pytorch/pull/174079 changes ctx.needs_input_grad
+from a stored tuple to a dynamic property that recomputes on each access using
+task_should_compute_output(). This allows custom autograd.Function backward
+methods to see which gradients are actually needed when inputs= is specified
+in backward().
+
+Because the getter is now dynamic, code that previously mutated
+ctx.needs_input_grad (in torch/_library/autograd.py) can no longer do so --
+the next read would bypass the stored value. A _WrappedCtx wrapper is
+introduced that intercepts needs_input_grad reads while forwarding everything
+else to the inner ctx.
+
+Implementation
+--------------
+The wrapper reuses functorch's WrappedCtx pattern (torch/_functorch/autograd_function.py),
+redefined in torch/_library/autograd.py to avoid a circular import. It uses
+_pt_reserved_attrs to distinguish wrapper-internal fields from user-set fields
+on ctx, forwarding everything else to the inner ctx.
+
+    class _WrappedCtx:
+        _pt_reserved_attrs: tuple[str, ...] = ("_pt_reserved_attrs", "_pt_inner_ctx")
+
+        def __init__(self, ctx):
+            if not isinstance(ctx, _WrappedCtx):
+                reserved_attrs = type(self)._pt_reserved_attrs
+                for name in reserved_attrs:
+                    if not hasattr(ctx, name):
+                        continue
+                    raise RuntimeError(
+                        f"PyTorch reserves the {reserved_attrs} field on ctx. "
+                        "Please name your fields on ctx something else to avoid "
+                        "name collision."
+                    )
+            self._pt_inner_ctx = ctx
+
+        def __getattr__(self, name):
+            return getattr(self._pt_inner_ctx, name)
+
+        def __setattr__(self, name, value):
+            if name in type(self)._pt_reserved_attrs:
+                self.__dict__[name] = value
+                return
+            return setattr(self._pt_inner_ctx, name, value)
+
+    class _CtxWithNeedsInputGrad(_WrappedCtx):
+        _pt_reserved_attrs = ("_pt_needs_input_grad", *_WrappedCtx._pt_reserved_attrs)
+
+        def __init__(self, ctx, needs_input_grad):
+            super().__init__(ctx)
+            self._pt_needs_input_grad = needs_input_grad
+
+        @property
+        def needs_input_grad(self):
+            return self._pt_needs_input_grad
+
+The base _WrappedCtx is identical to functorch's WrappedCtx (which is also used
+by CtxWithSavedTensors and CtxCustomSave for vmap/grad transforms).
+_CtxWithNeedsInputGrad extends it to intercept needs_input_grad specifically.
+
+Scope
+-----
+The wrapper is only used in torch/_library/autograd.py for library-registered
+custom ops (via torch.library). It is NOT used for user-written
+autograd.Function subclasses -- those get the dynamic getter directly on the
+real ctx.
+
+Class Hierarchy
+---------------
+The real ctx is a THPFunction (C extension type) with the MRO:
+FBackward -> BackwardCFunction -> _C._FunctionBase -> FunctionCtx -> _HookMixin -> object
+
+Each class contributes the following attributes (used to verify exhaustiveness
+of the audit below):
+
+  _C._FunctionBase (torch/csrc/autograd/python_function.cpp):
+    PyGetSetDef (16): saved_tensors, saved_variables, _raw_saved_tensors,
+      next_functions, needs_input_grad, requires_grad, metadata,
+      _input_metadata, to_save, non_differentiable, dirty_tensors,
+      saved_for_forward, materialize_grads, _is_pure_view,
+      _materialize_non_diff_grads, _compiled_autograd_backward_state
+    PyMethodDef (9): name, _sequence_nr, _set_sequence_nr,
+      maybe_clear_saved_tensors, apply (class method), _register_hook_dict,
+      register_hook, register_prehook, _get_compiled_autograd_symints
+
+  FunctionCtx (torch/autograd/function.py):
+    Methods (6): save_for_backward, save_for_forward, mark_dirty,
+      mark_shared_storage (deprecated noop), mark_non_differentiable,
+      set_materialize_grads
+
+  _HookMixin (torch/autograd/function.py):
+    Static methods (1): _register_hook
+
+  BackwardCFunction (torch/autograd/function.py):
+    Methods (3): apply (instance), apply_jvp, _compiled_autograd_key
+    Class attrs via FunctionMeta (2): _forward_cls, _autograd_function_id
+
+  object:
+    Standard dunder methods only (covered in Object Protocol section)
+
+Total: 16 properties + 9 C methods + 6 Python methods + 1 static + 3 instance
+       + 2 class attrs = 37 named attributes. All 37 appear in the audit below.
+
+Public Surface Audit
+--------------------
+Every attribute/method accessible from Python is listed below with whether the
+wrapper handles it correctly.
+
+C-level properties (PyGetSetDef on _FunctionBase):
+
+  saved_tensors             backward    OK  forwarded via __getattr__
+  saved_variables           backward    OK  forwarded (deprecated alias)
+  _raw_saved_tensors        internal    OK  forwarded
+  next_functions            rare        OK  forwarded
+  needs_input_grad          backward    OK  INTERCEPTED - returns transformed value
+  requires_grad             no          OK  forwarded
+  metadata                  internal    OK  forwarded
+  _input_metadata           internal    OK  forwarded
+  to_save                   fwd only    OK  forwarded
+  non_differentiable        fwd only    OK  forwarded
+  dirty_tensors             fwd only    OK  forwarded
+  saved_for_forward         jvp only    OK  forwarded
+  materialize_grads         fwd only    OK  forwarded
+  _is_pure_view             internal    OK  forwarded
+  _materialize_non_diff_grads  internal OK  forwarded
+  _compiled_autograd_backward_state  internal  OK  forwarded
+
+C-level methods (PyMethodDef on _FunctionBase):
+
+  register_hook             possible    OK  forwarded, operates on inner ctx
+  register_prehook          possible    OK  forwarded
+  name                      rare        OK  forwarded
+  _sequence_nr              internal    OK  forwarded
+  _set_sequence_nr          internal    OK  forwarded
+  maybe_clear_saved_tensors internal    OK  forwarded
+  _register_hook_dict       internal    OK  forwarded
+  _get_compiled_autograd_symints  internal  OK  forwarded
+
+Python mixin methods (FunctionCtx):
+
+  save_for_backward         fwd only    OK  forwarded
+  save_for_forward          fwd only    OK  forwarded
+  mark_dirty                fwd only    OK  forwarded
+  mark_shared_storage       deprecated  OK  forwarded (noop)
+  mark_non_differentiable   fwd only    OK  forwarded
+  set_materialize_grads     fwd only    OK  forwarded
+
+Python mixin methods (BackwardCFunction):
+
+  apply                     engine      OK  forwarded
+  apply_jvp                 fwd mode    OK  forwarded
+  _compiled_autograd_key    internal    OK  forwarded
+
+Python mixin (_HookMixin):
+
+  _register_hook (static)               OK  static method, not instance-dependent
+
+Class attrs (FunctionMeta):
+
+  _forward_cls              internal    OK  forwarded (class attr, accessed via type)
+  _autograd_function_id     internal    OK  forwarded (class attr, accessed via type)
+
+User-set attributes:
+
+  Read ctx.z (set during fwd)           OK  __getattr__ forwards to inner ctx
+  Write ctx.z = val in bwd              OK  __setattr__ forwards to inner ctx
+
+Object Protocol
+---------------
+  isinstance(ctx, FunctionCtx)    WRONG  returns False          risk: MEDIUM
+  type(ctx)                       WRONG  returns _CtxWithNeedsInputGrad  risk: LOW
+  vars(ctx) / ctx.__dict__        OK     works (shows _pt_* reserved attrs)
+  dir(ctx)                        WARN   shows _CtxWithNeedsInputGrad attrs  risk: VERY LOW
+  repr(ctx) / str(ctx)            WARN   default object.__repr__  risk: VERY LOW
+  id(ctx) / is                    WARN   different identity       risk: VERY LOW
+  weakref.ref(ctx)                OK     works (has __weakref__)
+  hash(ctx)                       OK     default id-based hash
+  bool(ctx)                       OK     returns True
+  == / !=                         WARN   identity-based           risk: VERY LOW
+  pickle                          WRONG  fails (real ctx also can't be pickled)
+  copy.copy()                     WARN   copies wrapper, not inner  risk: VERY LOW
+  dunder methods (__getitem__ etc) N/A   not defined on THPFunction
+
+Top Risks
+---------
+1. isinstance checks (Medium): isinstance(ctx, FunctionCtx) returns False.
+   Mitigable by adding a __class__ property that returns type(self._pt_inner_ctx).
+   This is the only realistic risk.
+
+2. type() checks (Low): type(ctx) is BackwardCFunction returns False (returns
+   _CtxWithNeedsInputGrad). Not fixable without a C extension type. However,
+   type() exact checks are uncommon -- isinstance is the standard idiom.
+
+3. Wrapper is only used for torch.library ops (context): The wrapper only
+   applies to ops registered via torch.library.register_autograd. User-written
+   autograd.Function subclasses receive the real ctx with the dynamic getter
+   directly -- no wrapper involved. This significantly limits the blast radius.
+
+Decision Point
+--------------
+Should we add __class__ property forwarding?
+
+    @property
+    def __class__(self):
+        return type(self._pt_inner_ctx)
+
+This makes isinstance transparent. The tradeoff is that it makes the wrapper
+subtler to debug -- isinstance says it's a BackwardCFunction but type() says
+it's _CtxWithNeedsInputGrad.
